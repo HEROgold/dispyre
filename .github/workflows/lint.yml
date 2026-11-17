@@ -44,16 +44,16 @@ jobs:
         run: uv sync --group dev
 
       - name: ty check
-        run: uv run ty check
+        run: uv run ty check .
 
       - name: pyrefly check
-        run: uv run pyrefly check
+        run: uv run pyrefly check .
 
       # VERIFY: assumes funcsort supports a --check / dry-run flag that
       # exits non-zero without modifying files. Confirm against funcsort's
       # actual CLI before relying on this in a real repo.
       - name: funcsort check
-        run: uvx funcsort --check
+        run: uvx funcsort --check .
 
       # fix-lazy is not yet published to PyPI (see copier.yml use_fix_lazy
       # help text). Left commented out until it ships.
