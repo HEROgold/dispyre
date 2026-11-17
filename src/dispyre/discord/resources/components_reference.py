@@ -13,6 +13,73 @@ from dispyre.base import model
 from dispyre.discord.resources._types import Snowflake
 
 
+class ComponentTypes(IntEnum):
+    """Component Types.
+
+    https://docs.discord.com/developers/components/reference#component-object-component-types
+    """
+
+    ACTION_ROW = 1
+    """Container to display a row of interactive components"""
+
+    BUTTON = 2
+    """Button object"""
+
+    STRING_SELECT = 3
+    """Select menu for picking from defined text options"""
+
+    TEXT_INPUT = 4
+    """Text input object"""
+
+    USER_SELECT = 5
+    """Select menu for users"""
+
+    ROLE_SELECT = 6
+    """Select menu for roles"""
+
+    MENTIONABLE_SELECT = 7
+    """Select menu for mentionables (users *and* roles)"""
+
+    CHANNEL_SELECT = 8
+    """Select menu for channels"""
+
+    SECTION = 9
+    """Container to display text alongside an accessory component"""
+
+    TEXT_DISPLAY = 10
+    """Markdown text"""
+
+    THUMBNAIL = 11
+    """Small image that can be used as an accessory"""
+
+    MEDIA_GALLERY = 12
+    """Display images and other media"""
+
+    FILE = 13
+    """Displays an attached file"""
+
+    SEPARATOR = 14
+    """Component to add vertical padding between other components"""
+
+    CONTAINER = 17
+    """Container that visually groups a set of components"""
+
+    LABEL = 18
+    """Container associating a label and description with a component"""
+
+    FILE_UPLOAD = 19
+    """Component for uploading files"""
+
+    RADIO_GROUP = 21
+    """Single-choice set of options"""
+
+    CHECKBOX_GROUP = 22
+    """Multi-selectable group of checkboxes"""
+
+    CHECKBOX = 23
+    """Single checkbox for yes/no choice"""
+
+
 @model(kw_only=True)
 class AnatomyOfAComponent:
     """Anatomy of a Component.

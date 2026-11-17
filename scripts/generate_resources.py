@@ -33,6 +33,7 @@ from textwrap import dedent
 from docgen import (
     DOCS_ROOT,
     REPO_ROOT,
+    RESOURCE_OVERRIDES,
     Computed,
     Enum,
     Item,
@@ -171,7 +172,7 @@ def render_init(owner: dict[str, str], pages: list[str]) -> str:
 
 def generate(pages: dict[str, str]) -> Registry:
     registry = Registry()
-    per_page, models, skipped = collect(pages, registry)
+    per_page, models, skipped = collect(pages, registry, overrides=RESOURCE_OVERRIDES)
 
     # Pass 2: resolve field types now that every anchor is known.
     for item in models:
