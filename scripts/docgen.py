@@ -8,12 +8,14 @@ Description` tables into `Model`s whose field types resolve through a `Registry`
 
 from __future__ import annotations
 
+import json
 import keyword
 import re
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from textwrap import wrap
+from typing import Any
 
 DOCS_ROOT = "https://docs.discord.com"
 INDEX_URL = f"{DOCS_ROOT}/llms.txt"
@@ -118,12 +120,12 @@ class Registry:
         self.names.add(name)
         return name
 
-    def register(self, name: str, table: Table) -> None:
-        """Point the table's anchors, and its section's anchors, at `name`."""
+    def register(self, name: str, table: Table, *, section: bool = True) -> None:
+        """Point the table's anchors, and (with `section`) its section's anchors, at `name`."""
         target = (table.page, name)
         for anchor in table.anchors:
             self.by_anchor.setdefault((table.page, anchor), target)
-        for anchor in table.container_anchors:
+        for anchor in table.container_anchors if section else []:
             self.by_anchor.setdefault((table.page, anchor), target)
 
 
@@ -146,6 +148,24 @@ def load_page(path: str, *, offline: bool) -> str | None:
 
 
 # --- text helpers -----------------------------------------------------------
+
+
+# Code points of the typographic characters the docs use, and their ASCII stand-ins.
+ASCII = {
+    0x2018: "'",  # left single quotation mark
+    0x2019: "'",  # right single quotation mark
+    0x201C: '"',  # left double quotation mark
+    0x201D: '"',  # right double quotation mark
+    0x2013: "-",  # en dash
+    0x2014: " - ",  # em dash
+    0x2026: "...",  # horizontal ellipsis
+    0x00A0: " ",  # no-break space
+}
+
+
+def ascii_text(text: str) -> str:
+    """Replace typographic quotes, dashes and spaces, which ruff flags in generated code."""
+    return text.translate(ASCII)
 
 
 def unescape(text: str) -> str:
@@ -479,8 +499,32 @@ def linked_pages(pages: dict[str, str]) -> set[str]:
     return linked
 
 
-def enum_columns(table: Table) -> tuple[int, int] | None:
+Columns = tuple[int, int] | tuple[int, int, int | None]
+"""`(value column, name column)`, plus the column that documents each member if it isn't
+`Description`. A name column equal to the value column makes the values their own names."""
+
+Overrides = dict[tuple[str, str], Columns]
+"""Enum columns for tables the header-based guess gets wrong, keyed by `(page, heading)`."""
+
+HTTP_CODE = re.compile(r"^(\d{3})\s*\((.+)\)$")
+DOC_COLUMNS = ("description", "meaning", "explanation")
+
+RESOURCE_OVERRIDES: Overrides = {("components/reference", "Component Types"): (0, 1, 2)}
+"""Enum tables on the resource pages that the header guess misses; every generator that
+collects the resource pages passes these, so they all see the same classes."""
+
+
+def doc_column(table: Table, columns: Columns) -> int | None:
+    """Column holding the member docs: the override's, else the first documenting header."""
+    if len(columns) == 3:  # noqa: PLR2004
+        return columns[2]
+    return next((i for name in DOC_COLUMNS if (i := column(table, name)) is not None), None)
+
+
+def enum_columns(table: Table, overrides: Overrides | None = None) -> Columns | None:
     """Return `(value column, name column)` for an enum table, else `None`."""
+    if overrides and (table.page, plain(table.heading)) in overrides:
+        return overrides[table.page, plain(table.heading)]
     header = [cell.lower() for cell in table.header]
     if not header or header[0] == "field":
         return None
@@ -496,6 +540,8 @@ def enum_columns(table: Table) -> tuple[int, int] | None:
 def enum_value(cell: str) -> tuple[str, str] | None:
     """Return `(kind, python literal)` for a value cell, or `None` if it isn't one."""
     text = plain(cell).rstrip("*").strip().strip("\"'")
+    if match := HTTP_CODE.match(text):  # "404 (NOT FOUND)"
+        return "int", match.group(1)
     if re.fullmatch(r"-?\d+", text):
         return "int", text
     if match := SHIFT.search(text):  # "1 << 3", or "0x08 (1 << 3)" on the permissions page
@@ -505,11 +551,17 @@ def enum_value(cell: str) -> tuple[str, str] | None:
     return None
 
 
-def build_enum(table: Table, columns: tuple[int, int], registry: Registry) -> Enum | None:
-    value_col, name_col = columns
-    desc_col = column(table, "description")
+def build_enum(
+    table: Table, columns: Columns, registry: Registry, *, name: str = "", lenient: bool = False
+) -> Enum | None:
+    """Build an enum from a table; `lenient` skips rows with no usable value (`5xx` ranges)."""
+    value_col, name_col = columns[:2]
+    desc_col = doc_column(table, columns)
     rows = [row for row in table.rows if len(row) > value_col and plain(row[value_col])]
     parsed = [enum_value(row[value_col]) for row in rows]
+    if lenient:
+        kept = [(row, value) for row, value in zip(rows, parsed, strict=True) if value is not None]
+        rows, parsed = [r for r, _ in kept], [v for _, v in kept]
     values = [value for value in parsed if value is not None]
     if not values or len(values) != len(rows):
         return None
@@ -520,11 +572,12 @@ def build_enum(table: Table, columns: tuple[int, int], registry: Registry) -> En
         base = "IntFlag" if "flag" in kinds else "IntEnum"
     else:
         return None
-    name = registry.claim(pascal(table.heading), table)
-    enum = Enum(name, base, table)
+    enum = Enum(registry.claim(name or pascal(table.heading), table), base, table)
     seen: set[str] = set()
     for row, (_, literal) in zip(rows, values, strict=True):
         name_cell = row[name_col].strip("'\"") if len(row) > name_col else ""
+        if http := HTTP_CODE.match(plain(name_cell)):
+            name_cell = http.group(2)
         member = constant(name_cell) if name_cell else ""
         if not member.strip("_") or member in seen:
             member = constant(f"{member}_{literal}")
@@ -539,9 +592,9 @@ def build_enum(table: Table, columns: tuple[int, int], registry: Registry) -> En
 EXPRESSION = re.compile(r"^([a-z][a-z_]*)(?:\s*([-+])\s*(\d+))?$")
 
 
-def build_computed(table: Table, columns: tuple[int, int], registry: Registry) -> Computed | None:
+def build_computed(table: Table, columns: Columns, registry: Registry) -> Computed | None:
     """Turn a snowflake-typed table of `param +/- n` values into static methods."""
-    value_col, name_col = columns
+    value_col, name_col = columns[:2]
     type_col, desc_col = column(table, "type"), column(table, "description")
     computed = Computed("", table)
     for row in table.rows:
@@ -563,29 +616,45 @@ def module_name(page: str) -> str:
 
 
 def collect(
-    pages: dict[str, str], registry: Registry
+    pages: dict[str, str],
+    registry: Registry,
+    *,
+    overrides: Overrides | None = None,
+    renames: dict[tuple[str, str], str] | None = None,
+    enums_only: set[str] | None = None,
 ) -> tuple[dict[str, list[Item]], list[Model], list[str]]:
-    """Pass 1: name every class and register its anchors, so links resolve in pass 2."""
+    """Pass 1: name every class and register its anchors, so links resolve in pass 2.
+
+    `overrides` fixes the enum columns of tables the header guess gets wrong; `renames`
+    replaces the class name a table's heading would give (keyed by `(page, plain heading)`).
+    Pages in `enums_only` contribute their enums but no models.
+    """
     per_page: dict[str, list[Item]] = {page: [] for page in pages}
     models: list[Model] = []
     skipped: list[str] = []
+    renames = renames or {}
     for page, markdown in pages.items():
         for table in parse_tables(page, markdown):
+            renamed = renames.get((page, plain(table.heading)), "")
             if is_model_table(table):
-                name = registry.claim(pascal(strip_suffix(table.heading)), table)
+                if enums_only and page in enums_only:  # another generator owns this page's models
+                    continue
+                name = registry.claim(renamed or pascal(strip_suffix(table.heading)), table)
                 registry.register(name, table)
                 registry.models.add(name)
                 item = Model(name, table)
                 models.append(item)
                 per_page[page].append(item)
-            elif columns := enum_columns(table):
-                item = build_enum(table, columns, registry) or build_computed(
-                    table, columns, registry
-                )
+            elif columns := enum_columns(table, overrides):
+                fixed = bool(overrides and (page, plain(table.heading)) in overrides)
+                item = build_enum(
+                    table, columns, registry, name=renamed, lenient=fixed
+                ) or build_computed(table, columns, registry)
                 if item is None:
                     skipped.append(f"{page}: {plain(table.heading)} (unparseable values)")
                     continue
-                registry.register(item.name, table)
+                # An enum under "Component Object" must not stand for the object itself.
+                registry.register(item.name, table, section=not fixed)
                 per_page[page].append(item)
     return per_page, models, skipped
 
@@ -634,3 +703,99 @@ def render_computed(item: Computed) -> str:
             lines.append(docstring(rule.doc, "        "))
         lines.append(f"        return {expression}")
     return "\n".join(lines)
+
+
+# --- REST endpoints -----------------------------------------------------------
+
+METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+PATH_PARAM = re.compile(r"\{([a-z_]+)(?:\.([a-z_]+))?\}")
+ROUTE_LINE = re.compile(r"^/[^\s]*$")
+PARAM_HEADING = re.compile(r"\b(json|form|query string|query|url)\b.*\bparams?\b", re.IGNORECASE)
+
+
+@dataclass
+class Endpoint:
+    """One endpoint section from a resources page: heading, route line and param tables."""
+
+    page: str
+    name: str
+    method: str
+    path: str
+    """The route with links stripped and `{channel.id}` kept, e.g. `/channels/{channel.id}`."""
+    anchor: str
+    description: str = ""
+    deprecated: bool = False
+    text: str = ""
+    """The section's markdown, for notes such as "supports the `X-Audit-Log-Reason` header"."""
+    tables: list[Table] = field(default_factory=list)
+
+    @property
+    def audit_log_reason(self) -> bool:
+        """Whether the section says the endpoint reads `X-Audit-Log-Reason`."""
+        return "X-Audit-Log-Reason" in self.text
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """`(method, path)` with every placeholder reduced to `{}`, to match the OpenAPI spec."""
+        return self.method, PATH_PARAM.sub("{}", self.path)
+
+    @property
+    def url(self) -> str:
+        """Link to the endpoint's section in the docs."""
+        return f"{DOCS_ROOT}/developers/{self.page}#{self.anchor}"
+
+
+def parse_endpoints(page: str, markdown: str) -> list[Endpoint]:
+    """Find every `## Name` section whose first lines are an HTTP method and a route."""
+    lines = markdown.splitlines()
+    tables = parse_tables(page, markdown)
+    endpoints: list[Endpoint] = []
+    in_fence = False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+        heading = None if in_fence else HEADING.match(line)
+        if not heading or len(heading.group(1)) != 2 or i + 3 >= len(lines):  # noqa: PLR2004
+            continue
+        method = lines[i + 2].strip()
+        path = LINK.sub(r"\1", lines[i + 3]).strip()
+        if method not in METHODS or not ROUTE_LINE.match(path):
+            continue
+        name = plain(heading.group(2))
+        endpoint = Endpoint(page, name, method, path, slug(name))
+        endpoint.deprecated = "(deprecated)" in name.lower()
+        end = next(
+            (j for j in range(i + 4, len(lines)) if re.match(r"^#{1,2}\s", lines[j])), len(lines)
+        )
+        body = lines[i + 4 : end]
+        endpoint.text = "\n".join(body)
+        paragraphs = []
+        for text in body:
+            if text.startswith(("#", "|", ">", "```")):
+                break
+            paragraphs.append(text)
+        first = [p.strip() for p in re.split(r"\n\s*\n", "\n".join(paragraphs)) if p.strip()]
+        endpoint.description = plain(first[0]) if first else ""
+        endpoint.tables = [
+            t for t in tables if t.heading and slug(t.container or t.heading) == endpoint.anchor
+        ]
+        endpoints.append(endpoint)
+    return endpoints
+
+
+# --- OpenAPI spec -----------------------------------------------------------
+
+SPEC_URL = "https://raw.githubusercontent.com/discord/discord-api-spec/main/specs/openapi.json"
+SPEC_CACHE = REPO_ROOT / ".cache" / "discord-openapi.json"
+
+
+def load_spec(*, offline: bool) -> dict[str, Any]:
+    """Return Discord's OpenAPI spec, downloaded once per run into the cache."""
+    SPEC_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    if not offline:
+        print("fetching openapi.json")
+        SPEC_CACHE.write_text(fetch(SPEC_URL), "utf-8")
+    if not SPEC_CACHE.exists():
+        msg = "the OpenAPI spec is not cached; run without --offline"
+        raise SystemExit(msg)
+    return json.loads(SPEC_CACHE.read_text("utf-8"))

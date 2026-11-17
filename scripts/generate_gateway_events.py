@@ -41,6 +41,7 @@ from docgen import (
     LINE_LIMIT,
     LINK,
     REPO_ROOT,
+    RESOURCE_OVERRIDES,
     Computed,
     Enum,
     Field,
@@ -616,7 +617,7 @@ def prose(raw: str) -> str:
     lines: list[str] = []
     buffer: list[str] = []
     for line in plain(raw).splitlines():
-        line = line.strip()  # noqa: PLW2901
+        line = line.strip()
         if LIST_ITEM.match(line):
             if buffer:
                 lines.append(" ".join(buffer))
@@ -884,7 +885,7 @@ def generate(*, offline: bool) -> None:
         raise SystemExit(msg)
 
     registry = Registry()
-    per_page, resource_models, _ = collect(pages, registry)
+    per_page, resource_models, _ = collect(pages, registry, overrides=RESOURCE_OVERRIDES)
     for model in resource_models:
         build_model(model, registry)
     add_partials(per_page, registry)
