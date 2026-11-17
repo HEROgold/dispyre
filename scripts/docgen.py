@@ -66,6 +66,8 @@ class Table:
     container_anchors: list[str]
     header: list[str]
     rows: list[list[str]]
+    footnotes: dict[int, str] = field(default_factory=dict)
+    """Text of the `\\*` lines under the table, keyed by how many asterisks mark them."""
 
 
 @dataclass
@@ -233,10 +235,28 @@ def parse_tables(page: str, markdown: str) -> list[Table]:
             while i < len(lines) and lines[i].startswith("|"):
                 rows.append(split_row(lines[i]))
                 i += 1
-            tables.append(make_table(page, stack, header, rows))
+            table = make_table(page, stack, header, rows)
+            table.footnotes = parse_footnotes(lines, i)
+            tables.append(table)
             continue
         i += 1
     return tables
+
+
+FOOTNOTE = re.compile(r"^((?:\\\*)+)\s+(.+)$")
+
+
+def parse_footnotes(lines: list[str], start: int) -> dict[int, str]:
+    r"""Read the `\\* text` lines that follow a table, skipping blank lines between them."""
+    notes: dict[int, str] = {}
+    for line in lines[start:]:
+        if not line.strip():
+            continue
+        match = FOOTNOTE.match(line.strip())
+        if match is None:
+            break
+        notes[match.group(1).count("\\*")] = plain(match.group(2))
+    return notes
 
 
 def split_row(line: str) -> list[str]:
@@ -374,7 +394,7 @@ def render_model(item: Model) -> str:
 VALUE_COLUMNS = {"value", "integer", "id", "code"}
 
 
-NAME_ONLY_COLUMNS = {"enum", "feature", "type"}
+NAME_ONLY_COLUMNS = {"enum", "feature", "type", "status"}
 
 
 SHIFT = re.compile(r"\b1\s*<<\s*(\d+)\b")
@@ -586,3 +606,31 @@ def add_partials(per_page: dict[str, list[Item]], registry: Registry) -> None:
                     partial.fields.append(Field(f.name, annotation, optional=True, doc=f.doc))
                 result.append(partial)
         per_page[page] = result
+
+
+def render_enum(item: Enum) -> str:
+    source = f"{DOCS_ROOT}/developers/{item.table.page}#{item.table.anchors[-1]}"
+    lines = [
+        f"class {item.name}({item.base}):",
+        docstring(f"{plain(item.table.heading)}.", extra=source),
+    ]
+    for member in item.members:
+        lines.append(f"\n    {member.name} = {member.value}")
+        if member.doc:
+            lines.append(docstring(member.doc))
+    return "\n".join(lines)
+
+
+def render_computed(item: Computed) -> str:
+    source = f"{DOCS_ROOT}/developers/{item.table.page}#{item.table.anchors[-1]}"
+    lines = [f"class {item.name}:", docstring(f"{plain(item.table.heading)}.", extra=source)]
+    for rule in item.rules:
+        expression = rule.param
+        if rule.op:  # snowflakes are strings: do the arithmetic on ints, then convert back
+            expression = f"Snowflake(str(int({rule.param}) {rule.op} {rule.offset}))"
+        lines.append("\n    @staticmethod")
+        lines.append(f"    def {rule.name}({rule.param}: Snowflake) -> Snowflake:")
+        if rule.doc:
+            lines.append(docstring(rule.doc, "        "))
+        lines.append(f"        return {expression}")
+    return "\n".join(lines)

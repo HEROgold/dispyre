@@ -41,10 +41,10 @@ from docgen import (
     add_partials,
     build_model,
     collect,
-    docstring,
     load_pages,
     module_name,
-    plain,
+    render_computed,
+    render_enum,
     render_model,
 )
 
@@ -114,34 +114,6 @@ def render_cross_imports(page: str, names: set[str], owner: dict[str, str]) -> s
     for module, module_names in sorted(imports.items()):
         text += f"from {PACKAGE}.{module_name(module)} import {', '.join(module_names)}\n"
     return text
-
-
-def render_enum(item: Enum) -> str:
-    source = f"{DOCS_ROOT}/developers/{item.table.page}#{item.table.anchors[-1]}"
-    lines = [
-        f"class {item.name}({item.base}):",
-        docstring(f"{plain(item.table.heading)}.", extra=source),
-    ]
-    for member in item.members:
-        lines.append(f"\n    {member.name} = {member.value}")
-        if member.doc:
-            lines.append(docstring(member.doc))
-    return "\n".join(lines)
-
-
-def render_computed(item: Computed) -> str:
-    source = f"{DOCS_ROOT}/developers/{item.table.page}#{item.table.anchors[-1]}"
-    lines = [f"class {item.name}:", docstring(f"{plain(item.table.heading)}.", extra=source)]
-    for rule in item.rules:
-        expression = rule.param
-        if rule.op:  # snowflakes are strings: do the arithmetic on ints, then convert back
-            expression = f"Snowflake(str(int({rule.param}) {rule.op} {rule.offset}))"
-        lines.append("\n    @staticmethod")
-        lines.append(f"    def {rule.name}({rule.param}: Snowflake) -> Snowflake:")
-        if rule.doc:
-            lines.append(docstring(rule.doc, "        "))
-        lines.append(f"        return {expression}")
-    return "\n".join(lines)
 
 
 TYPES_MODULE = dedent('''\
