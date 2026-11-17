@@ -1,0 +1,808 @@
+#!/usr/bin/env python3
+"""Crawl Discord's resource docs and generate `@model` classes and enums from them.
+
+Discord's docs (a Mintlify site) serve each page as raw markdown at `<page>.md`.
+This script reads the page list from `llms.txt`, downloads every page under
+`/developers/resources/`, and parses two kinds of tables:
+
+- `| Field | Type | Description |` tables under a "... Structure" or "... Object"
+  heading become `@model` dataclasses. `field?` means the key may be missing
+  (default `None`), `?type` means the value may be null.
+- Tables with a value column (`Value`, `Integer`, `ID`, `Code`) next to a name
+  column become `IntEnum`, `IntFlag` (values written as `1 << n`) or `StrEnum`.
+
+- Two-column `Enum|Feature|Type | Description` tables become `StrEnum`s whose
+  values are the names themselves.
+
+Endpoint parameter tables (JSON/Form/Query params, response bodies) are skipped.
+Types defined outside `/resources/` (roles, teams, components, ...) are pulled in
+by following the links in type cells one page deep.
+
+Usage:
+    uv run scripts/generate_resources.py            # fetch, cache and generate
+    uv run scripts/generate_resources.py --offline  # regenerate from the cache only
+"""
+
+from __future__ import annotations
+
+import argparse
+import keyword
+import re
+import subprocess
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from textwrap import dedent, wrap
+
+DOCS_ROOT = "https://docs.discord.com"
+INDEX_URL = f"{DOCS_ROOT}/llms.txt"
+DOC_URL = re.compile(rf"{re.escape(DOCS_ROOT)}/developers/([a-z0-9/-]+)\.md")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+OUTPUT_DIR = REPO_ROOT / "src" / "dispyre" / "discord" / "resources"
+CACHE_DIR = REPO_ROOT / ".cache" / "discord-docs"
+PACKAGE = "dispyre.discord.resources"
+LINE_LIMIT = 100  # ruff.toml line-length
+USER_AGENT = "dispyre-docgen (+https://github.com/HEROgold/dispyre)"
+
+HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+TABLE_RULE = re.compile(r"^\|\s*:?-")
+CELL_SPLIT = re.compile(r"(?<!\\)\|")
+LINK = re.compile(r"\[([^\]]*)\]\(([^)]*)\)")
+SKIPPED_HEADING = re.compile(r"\b(params|parameters|response body)$", re.IGNORECASE)
+VALUE_COLUMNS = {"value", "integer", "id", "code"}
+NAME_ONLY_COLUMNS = {"enum", "feature", "type"}
+SHIFT = re.compile(r"\b1\s*<<\s*(\d+)\b")
+
+PRIMITIVES = {
+    "snowflake": "Snowflake",
+    "string": "str",
+    "str": "str",
+    "integer": "int",
+    "int": "int",
+    "number": "float",
+    "float": "float",
+    "double": "float",
+    "boolean": "bool",
+    "bool": "bool",
+    "iso8601 timestamp": "ISO8601Timestamp",
+    "is08601 timestamp": "ISO8601Timestamp",  # typo in the docs
+    "object": "dict[str, Any]",
+    "dict": "dict[str, Any]",
+    "mixed": "Any",
+}
+PLURALS = {"snowflakes": "snowflake", "strings": "string", "integers": "integer", "ints": "int"}
+
+
+@dataclass
+class Table:
+    """One markdown table plus the headings it sits under."""
+
+    page: str
+    heading: str
+    container: str
+    anchors: list[str]
+    container_anchors: list[str]
+    header: list[str]
+    rows: list[list[str]]
+
+
+@dataclass
+class Field:
+    """One field of a generated model."""
+
+    name: str
+    annotation: str
+    optional: bool
+    doc: str
+
+
+@dataclass
+class Model:
+    """A class generated from a `Field | Type` table."""
+
+    name: str
+    table: Table
+    fields: list[Field] = field(default_factory=list)
+    partial_of: str = ""
+
+
+@dataclass
+class Rule:
+    """One computed constant, such as `all_channels(guild_id) = guild_id - 1`."""
+
+    name: str
+    param: str
+    op: str
+    offset: int
+    doc: str
+
+
+@dataclass
+class Computed:
+    """A table of constants derived from a parameter, rendered as static methods."""
+
+    name: str
+    table: Table
+    rules: list[Rule] = field(default_factory=list)
+
+
+@dataclass
+class Member:
+    """One member of a generated enum."""
+
+    name: str
+    value: str
+    doc: str
+
+
+@dataclass
+class Enum:
+    """An enum generated from a value/name table."""
+
+    name: str
+    base: str
+    table: Table
+    members: list[Member] = field(default_factory=list)
+
+
+Item = Model | Enum | Computed
+
+
+@dataclass
+class Registry:
+    """Every generated class, keyed by the doc anchors that point at it."""
+
+    by_anchor: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    names: set[str] = field(default_factory=set)
+    models: set[str] = field(default_factory=set)
+    partials: set[str] = field(default_factory=set)
+    unresolved: dict[str, int] = field(default_factory=dict)
+
+    def partial(self, name: str) -> str:
+        """Name of the partial variant of `name`; the docs' own `PartialX` wins if it exists."""
+        if name not in self.models:
+            return name
+        if f"Partial{name}" not in self.names:
+            self.partials.add(name)
+        return f"Partial{name}"
+
+    def claim(self, name: str, table: Table) -> str:
+        """Return a unique class name, prefixing the section name on a clash."""
+        if name in self.names:
+            name = pascal(strip_suffix(table.container)) + name
+        base, n = name, 2
+        while name in self.names:
+            name, n = f"{base}{n}", n + 1
+        self.names.add(name)
+        return name
+
+    def register(self, name: str, table: Table) -> None:
+        """Point the table's anchors, and its section's anchors, at `name`."""
+        target = (table.page, name)
+        for anchor in table.anchors:
+            self.by_anchor.setdefault((table.page, anchor), target)
+        for anchor in table.container_anchors:
+            self.by_anchor.setdefault((table.page, anchor), target)
+
+
+# --- fetching ---------------------------------------------------------------
+
+
+def fetch(url: str) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})  # noqa: S310
+    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+        return response.read().decode("utf-8")
+
+
+def load_page(path: str, *, offline: bool) -> str | None:
+    """Return a page's markdown by docs path (`resources/user`), using the cache."""
+    cached = CACHE_DIR / f"{path.replace('/', '__')}.md"
+    if not offline:
+        print(f"fetching {path}")
+        cached.write_text(fetch(f"{DOCS_ROOT}/developers/{path}.md"), "utf-8")
+    return cached.read_text("utf-8") if cached.exists() else None
+
+
+def load_pages(*, offline: bool, only: list[str] | None, depth: int) -> dict[str, str]:
+    """Return `{docs path: markdown}` for the resource pages plus `depth` rounds of linked pages."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if offline:
+        paths = [p.stem.replace("__", "/") for p in sorted(CACHE_DIR.glob("resources__*.md"))]
+    else:
+        found = DOC_URL.findall(fetch(INDEX_URL))
+        paths = [path for path in dict.fromkeys(found) if path.startswith("resources/")]
+    if only:
+        paths = [path for path in paths if path.removeprefix("resources/") in only]
+    pages = {path: text for path in paths if (text := load_page(path, offline=offline))}
+    print(f"depth 0: {len(pages)} resource pages")
+
+    frontier = dict(pages)
+    for level in range(1, depth + 1):
+        new = sorted(linked_pages(frontier) - pages.keys())
+        frontier = {path: text for path in new if (text := load_page(path, offline=offline))}
+        print(f"depth {level}: +{len(frontier)} pages {sorted(frontier)}")
+        if not frontier:
+            break
+        pages.update(frontier)
+    return pages
+
+
+def linked_pages(pages: dict[str, str]) -> set[str]:
+    """Docs paths linked from the type cells of the pages' model tables."""
+    linked: set[str] = set()
+    for path, markdown in pages.items():
+        for table in parse_tables(path, markdown):
+            if is_model_table(table):
+                for row in table.rows:
+                    if len(row) > 1:
+                        urls = " ".join(url for _, url in LINK.findall(row[1]))
+                        linked.update(DOC_URL.findall(urls))
+    return linked
+
+
+# --- text helpers -----------------------------------------------------------
+
+
+def unescape(text: str) -> str:
+    return re.sub(r"\\(.)", r"\1", text).strip()
+
+
+def plain(text: str) -> str:
+    """Markdown cell to plain text: links become their label, escapes are dropped."""
+    text = LINK.sub(r"\1", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s*\\?\[\d+\\?\]", "", text)  # footnote markers: "gif \[1]"
+    return unescape(text).replace("`", "").strip()
+
+
+def slug(text: str) -> str:
+    """Mintlify's heading anchor: lowercase, punctuation dropped, hyphen runs collapsed."""
+    text = re.sub(r"[^a-z0-9 -]", "", plain(text).lower())
+    return re.sub(r"[\s-]+", "-", text).strip("-")
+
+
+def pascal(text: str) -> str:
+    words = re.findall(r"[A-Za-z0-9]+", plain(text))
+    name = "".join(word[:1].upper() + word[1:] for word in words)
+    return f"_{name}" if name[:1].isdigit() else name
+
+
+def strip_suffix(heading: str) -> str:
+    return re.sub(r"\s+(structure|object)$", "", plain(heading), flags=re.IGNORECASE)
+
+
+def identifier(text: str) -> str:
+    name = re.sub(r"\W+", "_", plain(text)).strip("_")
+    if not name or name[0].isdigit():
+        name = f"_{name}"
+    return f"{name}_" if keyword.iskeyword(name) else name
+
+
+def constant(text: str) -> str:
+    name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", plain(text))
+    return identifier(name).upper()
+
+
+def docstring(text: str, indent: str = "    ", *, extra: str = "") -> str:
+    """Render a docstring, wrapped to the line limit; `extra` is a trailing paragraph."""
+    text = text.replace("\\", "\\\\").replace('"""', '\\"\\"\\"').strip()
+    if not text:
+        return ""
+    if text.endswith('"'):
+        text = text[:-1] + '\\"'
+    one_line = f'{indent}"""{text}"""'
+    if not extra and len(one_line) <= LINE_LIMIT:
+        return one_line
+    lines = wrap(text, LINE_LIMIT - len(indent) - 3)
+    if extra:
+        lines += ["", extra]
+    body = "\n".join(f"{indent}{line}" if line else "" for line in lines[1:])
+    return f'{indent}"""{lines[0]}\n{body}\n{indent}"""'
+
+
+# --- parsing ----------------------------------------------------------------
+
+
+def parse_tables(page: str, markdown: str) -> list[Table]:
+    """Collect every table on a page with its heading, section and anchors."""
+    tables: list[Table] = []
+    stack: list[tuple[int, str]] = []
+    lines = markdown.splitlines()
+    in_fence = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+        elif not in_fence and (match := HEADING.match(line)):
+            level = len(match.group(1))
+            stack = [(lvl, text) for lvl, text in stack if lvl < level]
+            stack.append((level, match.group(2)))
+        elif (
+            not in_fence
+            and line.startswith("|")
+            and i + 1 < len(lines)
+            and TABLE_RULE.match(lines[i + 1])
+        ):
+            header = [plain(cell) for cell in split_row(line)]
+            rows = []
+            i += 2
+            while i < len(lines) and lines[i].startswith("|"):
+                rows.append(split_row(lines[i]))
+                i += 1
+            tables.append(make_table(page, stack, header, rows))
+            continue
+        i += 1
+    return tables
+
+
+def split_row(line: str) -> list[str]:
+    return [cell.strip() for cell in CELL_SPLIT.split(line.strip().strip("|"))]
+
+
+def make_table(
+    page: str, stack: list[tuple[int, str]], header: list[str], rows: list[list[str]]
+) -> Table:
+    heading = stack[-1][1] if stack else ""
+    parents = [text for _, text in stack[:-1] if _ > 1]
+    container = parents[-1] if parents else ""
+    own = slug(heading)
+    anchors = [own] + [f"{slug(parent)}-{own}" for parent in parents]
+    container_anchors = [slug(container)] if container else []
+    return Table(page, heading, container, anchors, container_anchors, header, rows)
+
+
+def column(table: Table, name: str) -> int | None:
+    """Index of the header cell called `name` (case-insensitive), if any."""
+    return next((i for i, cell in enumerate(table.header) if cell.lower() == name), None)
+
+
+def is_model_table(table: Table) -> bool:
+    header = [cell.lower() for cell in table.header]
+    return header[:2] == ["field", "type"] and not SKIPPED_HEADING.search(plain(table.heading))
+
+
+def enum_columns(table: Table) -> tuple[int, int] | None:
+    """Return `(value column, name column)` for an enum table, else `None`."""
+    header = [cell.lower() for cell in table.header]
+    if not header or header[0] == "field":
+        return None
+    if header in ([name, "description"] for name in NAME_ONLY_COLUMNS):
+        return (0, 0)
+    value = next((i for i, cell in enumerate(header) if cell in VALUE_COLUMNS), None)
+    if value is None:
+        return None
+    name = next((i for i, cell in enumerate(header) if i != value and cell != "description"), None)
+    return None if name is None else (value, name)
+
+
+def enum_value(cell: str) -> tuple[str, str] | None:
+    """Return `(kind, python literal)` for a value cell, or `None` if it isn't one."""
+    text = plain(cell).rstrip("*").strip().strip("\"'")
+    if re.fullmatch(r"-?\d+", text):
+        return "int", text
+    if match := SHIFT.search(text):  # "1 << 3", or "0x08 (1 << 3)" on the permissions page
+        return "flag", f"1 << {match.group(1)}"
+    if text and not re.search(r"\s", text):
+        return "str", repr(text)
+    return None
+
+
+# --- building ---------------------------------------------------------------
+
+
+def build_enum(table: Table, columns: tuple[int, int], registry: Registry) -> Enum | None:
+    value_col, name_col = columns
+    desc_col = column(table, "description")
+    rows = [row for row in table.rows if len(row) > value_col and plain(row[value_col])]
+    parsed = [enum_value(row[value_col]) for row in rows]
+    values = [value for value in parsed if value is not None]
+    if not values or len(values) != len(rows):
+        return None
+    kinds = {kind for kind, _ in values}
+    if kinds == {"str"}:
+        base = "StrEnum"
+    elif kinds <= {"int", "flag"}:
+        base = "IntFlag" if "flag" in kinds else "IntEnum"
+    else:
+        return None
+    name = registry.claim(pascal(table.heading), table)
+    enum = Enum(name, base, table)
+    seen: set[str] = set()
+    for row, (_, literal) in zip(rows, values, strict=True):
+        name_cell = row[name_col].strip("'\"") if len(row) > name_col else ""
+        member = constant(name_cell) if name_cell else ""
+        if not member.strip("_") or member in seen:
+            member = constant(f"{member}_{literal}")
+        seen.add(member)
+        doc = plain(row[desc_col]) if desc_col is not None and len(row) > desc_col else ""
+        enum.members.append(Member(member, literal, doc))
+    return enum
+
+
+# Tables whose values are expressions: accept only `name` or `name +/- digits`, so no
+# text from the docs ever ends up in generated code unchecked.
+EXPRESSION = re.compile(r"^([a-z][a-z_]*)(?:\s*([-+])\s*(\d+))?$")
+
+
+def build_computed(table: Table, columns: tuple[int, int], registry: Registry) -> Computed | None:
+    """Turn a snowflake-typed table of `param +/- n` values into static methods."""
+    value_col, name_col = columns
+    type_col, desc_col = column(table, "type"), column(table, "description")
+    computed = Computed("", table)
+    for row in table.rows:
+        match = EXPRESSION.match(plain(row[value_col])) if len(row) > value_col else None
+        is_snowflake = type_col is not None and plain(row[type_col]).lower() == "snowflake"
+        if match is None or not is_snowflake:
+            return None
+        param, op, offset = match.group(1), match.group(2) or "", int(match.group(3) or 0)
+        doc = plain(row[desc_col]) if desc_col is not None else ""
+        name = identifier(plain(row[name_col]).lower())
+        computed.rules.append(Rule(name.strip("_") or name, param, op, offset, doc))
+    computed.name = registry.claim(pascal(table.heading), table)
+    return computed
+
+
+def resolve_link(label: str, url: str, page: str, registry: Registry) -> str | None:
+    target_url, _, anchor = url.partition("#")
+    match = DOC_URL.search(target_url)
+    target = match.group(1) if match else (page if not target_url else None)
+    if target is None:
+        return None
+    hit = registry.by_anchor.get((target, anchor)) or registry.by_anchor.get(
+        (target, f"{slug(label)}-object")
+    )
+    return hit[1] if hit else None
+
+
+def resolve_type(raw: str, page: str, registry: Registry) -> tuple[str, bool]:
+    """Turn a docs type cell into `(annotation, nullable)`."""
+    text = re.sub(r"\s*\((?![^)]*://)[^)]*\)", "", raw)  # drop "(notes)", keep link urls
+    text = unescape(text).rstrip("*").strip()
+    nullable = text.startswith("?")
+    text = text.removeprefix("?").strip()
+    return resolve_inner(text, page, registry), nullable
+
+
+LIST_OF = re.compile(r"^\[?(?:array|list)\]?(?:\([^)]*\))?\s+of\s+(.*)$", re.IGNORECASE)
+PHRASES = [
+    (re.compile(r"^array$"), "list[Any]"),
+    (re.compile(r"^dictionary with keys in"), "dict[str, str]"),  # locale -> localized text
+    (re.compile(r"\bstrings?$"), "str"),  # "[guild feature] strings"
+    (re.compile(r"\bids?$"), "Snowflake"),  # "[role] object ids"
+]
+
+
+def resolve_inner(text: str, page: str, registry: Registry) -> str:
+    text = re.sub(r"^(an?|the)\s+", "", text, flags=re.IGNORECASE)
+    if match := LIST_OF.match(text):
+        return f"list[{resolve_inner(match.group(1), page, registry)}]"
+    text = re.sub(r"^one of\s+", "", text, flags=re.IGNORECASE)
+    lowered = plain(text).lower()
+    for pattern, annotation in PHRASES:
+        if pattern.search(lowered):
+            return annotation
+    links = LINK.findall(text)
+    names = [resolve_link(label, url, page, registry) for label, url in links]
+    if found := [name for name in names if name]:
+        if lowered.startswith("partial "):
+            found = [registry.partial(name) for name in found]
+        return " | ".join(dict.fromkeys(found))
+    if annotation := resolve_words(lowered, page, registry, linked=bool(links)):
+        return annotation
+    registry.unresolved[text] = registry.unresolved.get(text, 0) + 1
+    return "dict[str, Any]" if "object" in lowered or links else "Any"
+
+
+def resolve_words(lowered: str, page: str, registry: Registry, *, linked: bool) -> str | None:
+    """Resolve an unlinked type: a primitive, `dict<k, v>`, `X or Y`, or a class by name."""
+    words = re.sub(r"\s+(objects?|ids?)$", "", lowered.removeprefix("partial ").strip())
+    words = PLURALS.get(words, words)
+    if words in PRIMITIVES:
+        return PRIMITIVES[words]
+    if not linked and (name := pascal(words)) in registry.names:  # "channel object"
+        return registry.partial(name) if lowered.startswith("partial ") else name
+    if match := re.match(r"^dict<(\w+),\s*(\w+)>$", words):
+        key, value = (PRIMITIVES.get(group, "Any") for group in match.groups())
+        return f"dict[{key}, {value}]"
+    if " or " in words:
+        parts = [resolve_inner(part, page, registry) for part in words.split(" or ")]
+        return " | ".join(dict.fromkeys(parts))
+    return None
+
+
+def build_model(model: Model, registry: Registry) -> None:
+    table = model.table
+    desc_col = column(table, "description")
+    seen: set[str] = set()
+    for row in table.rows:
+        if len(row) < 2 or not plain(row[0]):  # noqa: PLR2004
+            continue
+        raw_name = plain(row[0]).rstrip("*").strip()
+        optional = raw_name.endswith("?")
+        name = identifier(raw_name.rstrip("?"))
+        if name in seen:
+            continue
+        seen.add(name)
+        annotation, nullable = resolve_type(row[1], table.page, registry)
+        if nullable or optional:
+            annotation = f"{annotation} | None"
+        doc = plain(row[desc_col]) if desc_col is not None and len(row) > desc_col else ""
+        model.fields.append(Field(name, annotation, optional, doc))
+
+
+# --- rendering --------------------------------------------------------------
+
+
+def module_name(page: str) -> str:
+    """`resources/user` -> `user`, `topics/permissions` -> `topics_permissions`."""
+    return page.removeprefix("resources/").replace("/", "_").replace("-", "_")
+
+
+def render_module(page: str, items: list[Item], owner: dict[str, str]) -> str:
+    """Render one docs page as a Python module."""
+    local = {item.name for item in items}
+    used: set[str] = set()
+    bodies: list[str] = []
+    for item in items:
+        if isinstance(item, Enum):
+            bodies.append(render_enum(item))
+        elif isinstance(item, Computed):
+            bodies.append(render_computed(item))
+            used.add("Snowflake")
+        else:
+            bodies.append(render_model(item))
+            for f in item.fields:
+                used.update(re.findall(r"[A-Za-z_]\w*", f.annotation))
+    header = dedent(f'''\
+        """Models for Discord's {page.rpartition("/")[2].replace("-", " ")} docs page.
+
+        Generated by `scripts/generate_resources.py` from
+        {DOCS_ROOT}/developers/{page}. Do not edit by hand.
+        """
+
+        from __future__ import annotations
+
+        ''')
+    body = "\n\n\n".join(bodies)
+    cross = render_cross_imports(page, used - local, owner)
+    return f"{header}{render_imports(items, used)}\n\n{body}\n{cross}"
+
+
+def render_imports(items: list[Item], used: set[str]) -> str:
+    """Top-of-module imports: enum bases, `Any`, `model` and the scalar aliases."""
+    lines: list[str] = []
+    if enum_bases := sorted({item.base for item in items if isinstance(item, Enum)}):
+        lines.append(f"from enum import {', '.join(enum_bases)}\n")
+    if "Any" in used:
+        lines.append("from typing import Any\n")
+    if any(isinstance(item, Model) for item in items):
+        lines.append("\nfrom dispyre.base import model\n")
+    if aliases := sorted(used & {"ISO8601Timestamp", "Snowflake"}):
+        lines.append(f"from {PACKAGE}._types import {', '.join(aliases)}\n")
+    return "".join(lines)
+
+
+def render_cross_imports(page: str, names: set[str], owner: dict[str, str]) -> str:
+    """Bottom-of-module imports of classes from other pages (E402 is ignored in ruff.toml)."""
+    imports: dict[str, list[str]] = {}
+    for name in sorted(names):
+        if name in owner and owner[name] != page:
+            imports.setdefault(owner[name], []).append(name)
+    if not imports:
+        return ""
+    text = "\n\n# Imported last so circular references between modules resolve at runtime.\n"
+    for module, module_names in sorted(imports.items()):
+        text += f"from {PACKAGE}.{module_name(module)} import {', '.join(module_names)}\n"
+    return text
+
+
+def render_model(item: Model) -> str:
+    source = f"{DOCS_ROOT}/developers/{item.table.page}#{item.table.anchors[-1]}"
+    summary = f"{plain(item.table.heading)}."
+    if item.partial_of:
+        summary = f"Partial {item.partial_of}: the same fields, any of which may be missing."
+    lines = [
+        "@model(kw_only=True)",
+        f"class {item.name}:",
+        docstring(summary, extra=source),
+    ]
+    for f in item.fields:
+        default = " = None" if f.optional else ""
+        lines.append(f"\n    {f.name}: {f.annotation}{default}")
+        if f.doc:
+            lines.append(docstring(f.doc))
+    return "\n".join(lines)
+
+
+def render_enum(item: Enum) -> str:
+    source = f"{DOCS_ROOT}/developers/{item.table.page}#{item.table.anchors[-1]}"
+    lines = [
+        f"class {item.name}({item.base}):",
+        docstring(f"{plain(item.table.heading)}.", extra=source),
+    ]
+    for member in item.members:
+        lines.append(f"\n    {member.name} = {member.value}")
+        if member.doc:
+            lines.append(docstring(member.doc))
+    return "\n".join(lines)
+
+
+def render_computed(item: Computed) -> str:
+    source = f"{DOCS_ROOT}/developers/{item.table.page}#{item.table.anchors[-1]}"
+    lines = [f"class {item.name}:", docstring(f"{plain(item.table.heading)}.", extra=source)]
+    for rule in item.rules:
+        expression = rule.param
+        if rule.op:  # snowflakes are strings: do the arithmetic on ints, then convert back
+            expression = f"Snowflake(str(int({rule.param}) {rule.op} {rule.offset}))"
+        lines.append("\n    @staticmethod")
+        lines.append(f"    def {rule.name}({rule.param}: Snowflake) -> Snowflake:")
+        if rule.doc:
+            lines.append(docstring(rule.doc, "        "))
+        lines.append(f"        return {expression}")
+    return "\n".join(lines)
+
+
+TYPES_MODULE = dedent('''\
+    """Scalar aliases shared by the generated resource models.
+
+    Generated by `scripts/generate_resources.py`. Do not edit by hand.
+    """
+
+    from datetime import UTC, datetime
+    from typing import NewType, TypeAlias
+
+    DISCORD_EPOCH_MS = 1_420_070_400_000
+    """2015-01-01T00:00:00Z, the zero point of snowflake timestamps."""
+
+    Snowflake = NewType("Snowflake", str)
+    """A Discord id, kept as the string the API sends. Distinct from `str` for type checkers."""
+
+    ISO8601Timestamp: TypeAlias = str
+    """An ISO 8601 timestamp string as sent by the API."""
+
+
+    def snowflake_time(snowflake: Snowflake) -> datetime:
+        """When the object behind `snowflake` was created."""
+        return datetime.fromtimestamp(((int(snowflake) >> 22) + DISCORD_EPOCH_MS) / 1000, UTC)
+    ''')
+
+
+def render_init(owner: dict[str, str], pages: list[str]) -> str:
+    lines = [
+        dedent('''\
+            """Models representing Discord resources.
+
+            Generated by `scripts/generate_resources.py` from
+            https://docs.discord.com/developers/resources. Do not edit by hand.
+            """
+
+            '''),
+    ]
+    by_page: dict[str, list[str]] = {}
+    for name, page in owner.items():
+        by_page.setdefault(page, []).append(name)
+    for page in pages:
+        names = sorted(by_page.get(page, []))
+        if names:
+            joined = ", ".join(names)
+            lines.append(f"from {PACKAGE}.{module_name(page)} import ({joined},)\n")
+    lines.append("\n__all__ = [\n")
+    lines.extend(f'    "{name}",\n' for name in sorted(owner))
+    lines.append("]\n")
+    return "".join(lines)
+
+
+# --- main -------------------------------------------------------------------
+
+
+def generate(pages: dict[str, str]) -> Registry:
+    registry = Registry()
+    per_page: dict[str, list[Item]] = {page: [] for page in pages}
+    models: list[Model] = []
+    skipped: list[str] = []
+
+    # Pass 1: name every class and register its anchors, so links resolve in pass 2.
+    for page, markdown in pages.items():
+        for table in parse_tables(page, markdown):
+            if is_model_table(table):
+                name = registry.claim(pascal(strip_suffix(table.heading)), table)
+                registry.register(name, table)
+                registry.models.add(name)
+                item = Model(name, table)
+                models.append(item)
+                per_page[page].append(item)
+            elif columns := enum_columns(table):
+                item = build_enum(table, columns, registry) or build_computed(
+                    table, columns, registry
+                )
+                if item is None:
+                    skipped.append(f"{page}: {plain(table.heading)} (unparseable values)")
+                    continue
+                registry.register(item.name, table)
+                per_page[page].append(item)
+
+    # Pass 2: resolve field types now that every anchor is known.
+    for item in models:
+        build_model(item, registry)
+    add_partials(per_page, registry)
+
+    write_output(per_page)
+    report(per_page, skipped, registry)
+    return registry
+
+
+def add_partials(per_page: dict[str, list[Item]], registry: Registry) -> None:
+    """Insert a `PartialX` right after each model X that a "partial [x]" type points at."""
+    for page, items in per_page.items():
+        result: list[Item] = []
+        for item in items:
+            result.append(item)
+            if isinstance(item, Model) and item.name in registry.partials:
+                name = registry.claim(f"Partial{item.name}", item.table)
+                partial = Model(name, item.table, partial_of=item.name)
+                for f in item.fields:
+                    annotation = f.annotation
+                    if not annotation.endswith(" | None"):
+                        annotation = f"{annotation} | None"
+                    partial.fields.append(Field(f.name, annotation, optional=True, doc=f.doc))
+                result.append(partial)
+        per_page[page] = result
+
+
+GENERATED_MARKER = "Generated by `scripts/generate_resources.py`"
+
+
+def write_output(per_page: dict[str, list[Item]]) -> None:
+    """Write one module per page plus `_types.py` and `__init__.py`, then ruff them."""
+    owner = {item.name: page for page, items in per_page.items() for item in items}
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    written = {OUTPUT_DIR / "_types.py", OUTPUT_DIR / "__init__.py"}
+    (OUTPUT_DIR / "_types.py").write_text(TYPES_MODULE, "utf-8")
+    for page, items in per_page.items():
+        if items:
+            path = OUTPUT_DIR / f"{module_name(page)}.py"
+            path.write_text(render_module(page, items, owner), "utf-8")
+            written.add(path)
+    (OUTPUT_DIR / "__init__.py").write_text(render_init(owner, list(per_page)), "utf-8")
+    # Drop modules an earlier run generated but this one didn't (say, after lowering --depth).
+    for path in OUTPUT_DIR.glob("*.py"):
+        if path not in written and GENERATED_MARKER in path.read_text("utf-8")[:500]:
+            print(f"removing stale {path.name}")
+            path.unlink()
+    ruff = ["uv", "run", "ruff"]
+    subprocess.run([*ruff, "check", "--fix", "--quiet", str(OUTPUT_DIR)], check=False)
+    subprocess.run([*ruff, "format", "--quiet", str(OUTPUT_DIR)], check=True)
+
+
+def report(per_page: dict[str, list[Item]], skipped: list[str], registry: Registry) -> None:
+    items = [item for page_items in per_page.values() for item in page_items]
+    counts = {
+        kind.__name__: sum(isinstance(item, kind) for item in items)
+        for kind in (Model, Enum, Computed)
+    }
+    partials = sum(isinstance(item, Model) and bool(item.partial_of) for item in items)
+    summary = ", ".join(f"{n} {kind}" for kind, n in counts.items() if n)
+    print(f"\n{len(per_page)} pages: {summary} ({partials} partials) -> {OUTPUT_DIR}")
+    for line in skipped:
+        print(f"skipped {line}")
+    if registry.unresolved:
+        total = sum(registry.unresolved.values())
+        print(f"\n{total} unresolved types (emitted as Any / dict[str, Any]):")
+        for text, count in sorted(registry.unresolved.items(), key=lambda kv: -kv[1]):
+            print(f"  {count:3}x  {text}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--offline", action="store_true", help="only use cached pages")
+    parser.add_argument("--pages", nargs="*", help="page slugs to include, e.g. user channel")
+    parser.add_argument(
+        "--depth", type=int, default=2, help="rounds of linked pages to follow (default 2)"
+    )
+    args = parser.parse_args()
+    generate(load_pages(offline=args.offline, only=args.pages, depth=args.depth))
+
+
+if __name__ == "__main__":
+    main()

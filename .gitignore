@@ -39,3 +39,6 @@ site/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Downloaded docs used by scripts/generate_resources.py
+.cache/
