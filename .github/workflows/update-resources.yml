@@ -24,18 +24,31 @@ jobs:
       # Builds on the resource models from the step above and fetches the gateway pages.
       - run: uv run scripts/generate_gateway_events.py
 
+      # Opcodes, status codes, voice, rate limits, locales, OAuth2, RPC and webhook events.
+      # Also builds on the resource models.
+      - run: uv run scripts/generate_topics.py
+
+      # Routes, models and client methods from Discord's OpenAPI spec, with docs as fallback.
+      - run: uv run scripts/generate_rest.py
+
       - uses: peter-evans/create-pull-request@v6
         with:
           add-paths: |
             src/dispyre/discord/resources
             src/dispyre/discord/events
+            src/dispyre/discord/topics
+            src/dispyre/discord/rest/schemas.py
+            src/dispyre/discord/rest/routes.py
+            src/dispyre/discord/rest/client.py
+            src/dispyre/discord/rest/__init__.py
             tests/fixtures/gateway_event_examples.json
           branch: chore/update-discord-resources
-          commit-message: "chore: regenerate Discord resources and gateway events"
-          title: "chore: regenerate Discord resources and gateway events"
+          commit-message: "chore: regenerate Discord resources, events, topics and REST layer"
+          title: "chore: regenerate Discord resources, events, topics and REST layer"
           body: |
-            Discord's docs changed. Output of `scripts/generate_resources.py` and
-            `scripts/generate_gateway_events.py`.
+            Discord's docs or OpenAPI spec changed. Output of `scripts/generate_resources.py`,
+            `scripts/generate_gateway_events.py`, `scripts/generate_topics.py` and
+            `scripts/generate_rest.py`.
 
             0rwx: EXECUTE
           delete-branch: true
