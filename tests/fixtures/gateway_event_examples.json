@@ -1,0 +1,75 @@
+{
+  "send": {
+    "IDENTIFY": {
+      "token": "my_token",
+      "properties": {
+        "os": "linux",
+        "browser": "disco",
+        "device": "disco"
+      },
+      "compress": true,
+      "large_threshold": 250,
+      "shard": [
+        0,
+        1
+      ],
+      "presence": {
+        "activities": [
+          {
+            "name": "Cards Against Humanity",
+            "type": 0
+          }
+        ],
+        "status": "dnd",
+        "since": 91879201,
+        "afk": false
+      },
+      "intents": 5
+    },
+    "RESUME": {
+      "token": "randomstring",
+      "session_id": "evenmorerandomstring",
+      "seq": 1337
+    },
+    "REQUEST_GUILD_MEMBERS": {
+      "guild_id": "41771983444115456",
+      "query": "",
+      "limit": 0
+    },
+    "REQUEST_SOUNDBOARD_SOUNDS": {
+      "guild_ids": [
+        "613425648685547541",
+        "81384788765712384"
+      ]
+    },
+    "REQUEST_CHANNEL_INFO": {
+      "guild_id": "613425648685547541",
+      "fields": [
+        "status",
+        "voice_start_time"
+      ]
+    },
+    "UPDATE_VOICE_STATE": {
+      "guild_id": "41771983423143937",
+      "channel_id": "127121515262115840",
+      "self_mute": false,
+      "self_deaf": false
+    },
+    "UPDATE_PRESENCE": {
+      "since": 91879201,
+      "activities": [
+        {
+          "name": "Save the Oxford Comma",
+          "type": 0
+        }
+      ],
+      "status": "online",
+      "afk": false
+    }
+  },
+  "receive": {
+    "HELLO": {
+      "heartbeat_interval": 45000
+    }
+  }
+}
