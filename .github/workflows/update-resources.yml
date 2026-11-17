@@ -21,14 +21,21 @@ jobs:
 
       - run: uv run scripts/generate_resources.py
 
+      # Builds on the resource models from the step above and fetches the gateway pages.
+      - run: uv run scripts/generate_gateway_events.py
+
       - uses: peter-evans/create-pull-request@v6
         with:
-          add-paths: src/dispyre/discord/resources
+          add-paths: |
+            src/dispyre/discord/resources
+            src/dispyre/discord/events
+            tests/fixtures/gateway_event_examples.json
           branch: chore/update-discord-resources
-          commit-message: "chore: regenerate Discord resources"
-          title: "chore: regenerate Discord resources"
+          commit-message: "chore: regenerate Discord resources and gateway events"
+          title: "chore: regenerate Discord resources and gateway events"
           body: |
-            Discord's docs changed. Output of `scripts/generate_resources.py`.
+            Discord's docs changed. Output of `scripts/generate_resources.py` and
+            `scripts/generate_gateway_events.py`.
 
             0rwx: EXECUTE
           delete-branch: true
