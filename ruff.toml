@@ -1,0 +1,27 @@
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "D203",   # one-blank-line-before-class — conflicts with D211
+    "D213",   # multi-line-summary-second-line — conflicts with D212
+    "COM812", # trailing-comma-missing — conflicts with the formatter
+    "ISC001", # single-line-implicit-string-concat — conflicts with the formatter
+    "CPY001", # missing-copyright-notice — this template doesn't assume per-file headers
+    "D400",   # first-line-period — module docstrings are built from free-form project_description
+    "D415",   # first-line-punctuation — same reason
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["S101", "D"]
+# Internal task-runner scripts: subprocess calls PATH-resolved tools (uv,
+# uvx) by design, are small enough not to need per-function docstrings, and
+# use print() for plain CLI output.
+"scripts/*" = ["S603", "S607", "D103", "T201"]
+# A CLI's __main__.py legitimately prints to stdout as its actual output
+# mechanism, not debug leftovers.
+"**/__main__.py" = ["T201"]
+
+[format]
+docstring-code-format = true

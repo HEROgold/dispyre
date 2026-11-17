@@ -1,0 +1,40 @@
+[project]
+name = "dispyre"
+version = "0.1.0"
+description = "Opinionated, personal discord api wrapper + framework"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "HEROgold", email = "m21345384+HEROgold@users.noreply.github.com" }]
+requires-python = ">=3.11"
+dependencies = [
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "ty",
+    "pyrefly",
+    "prek",
+    "zensical",
+    "mkdocstrings[python]",
+]
+# funcsort (and, once published, fix-lazy) are deliberately NOT listed here
+# even when enabled — they run via `uvx` in CI and pre-commit, an isolated
+# ephemeral environment that doesn't get solved against this project's own
+# `requires-python` floor. Adding them as a real dev dependency would force
+# uv to satisfy funcsort's own Python>=3.12 floor against whatever (possibly
+# lower) min_python_version this project was generated with.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dispyre"]
+
+# Tool configuration deliberately lives in standalone files (ruff.toml,
+# pytest.toml, coverage.toml) rather than [tool.*] tables here — keeps
+# pyproject.toml focused on packaging metadata, matches the HEROgold
+# baseline repos this template is drawn from.

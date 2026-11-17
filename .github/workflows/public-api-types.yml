@@ -1,0 +1,89 @@
+# Public-API type-checker compatibility gate.
+#
+# This is deliberately independent of `dev_type_checkers` (copier.yml):
+# it always runs all five major type checkers (mypy, pyright, pyrefly, ty,
+# zuban) against modules that export a public `__all__`, because the point
+# here is "what will downstream users' checkers see", not "what's pleasant
+# for day-to-day local dev". zuban and ty are both less mature tools; they
+# are included anyway because breadth of coverage matters more for this
+# informational report than it would for a daily-dev dependency.
+#
+# Every checker step uses `continue-on-error: true` — this is a
+# compatibility/informational gate across 5 tools that may legitimately
+# disagree with each other, not a hard pass/fail merge gate.
+name: Public API Type Compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  public-api-types:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Sync dependencies
+        run: uv sync --group dev
+
+      - name: Find modules with a public __all__
+        id: find-public
+        run: |
+          set -eu
+          # Simple grep-based discovery is intentional here: a module-level
+          # `__all__` assignment is enough of a signal that it exports a
+          # public API, and this avoids needing a full AST walk just to
+          # build a file list for the type checkers below.
+          # Collapsed to a single space-separated line (rather than left
+          # newline-separated) so it can be safely interpolated straight
+          # into the `run:` command lines of the steps below.
+          FILES=$(grep -rl '^__all__' src/dispyre | tr '\n' ' ' || true)
+          if [ -z "$FILES" ]; then
+            echo "No modules with a module-level __all__ found; skipping."
+          fi
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+
+      - name: mypy
+        if: steps.find-public.outputs.files != ''
+        continue-on-error: true
+        run: uvx mypy ${{ steps.find-public.outputs.files }}
+
+      - name: pyright
+        if: steps.find-public.outputs.files != ''
+        continue-on-error: true
+        run: uvx pyright ${{ steps.find-public.outputs.files }}
+
+      - name: pyrefly
+        if: steps.find-public.outputs.files != ''
+        continue-on-error: true
+        run: uvx pyrefly check ${{ steps.find-public.outputs.files }}
+
+      - name: ty
+        if: steps.find-public.outputs.files != ''
+        continue-on-error: true
+        run: uvx ty check ${{ steps.find-public.outputs.files }}
+
+      # VERIFY: zuban's exact CLI invocation is unconfirmed — assuming a
+      # mypy-like `zuban check <files...>` interface here.
+      - name: zuban
+        if: steps.find-public.outputs.files != ''
+        continue-on-error: true
+        run: uvx zuban check ${{ steps.find-public.outputs.files }}
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Public API type-checker compatibility" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Ran mypy, pyright, pyrefly, ty, and zuban against every module" >> "$GITHUB_STEP_SUMMARY"
+          echo "with a module-level \`__all__\`. Each checker step above is" >> "$GITHUB_STEP_SUMMARY"
+          echo "non-blocking (continue-on-error) — check individual step logs" >> "$GITHUB_STEP_SUMMARY"
+          echo "for disagreements between tools." >> "$GITHUB_STEP_SUMMARY"

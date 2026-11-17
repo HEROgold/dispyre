@@ -1,0 +1,62 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ruff:
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Sync dependencies
+        run: uv sync --group dev
+
+      - name: Ruff check
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+  type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Sync dependencies
+        run: uv sync --group dev
+
+      - name: ty check
+        run: uv run ty check
+
+      - name: pyrefly check
+        run: uv run pyrefly check
+
+      # VERIFY: assumes funcsort supports a --check / dry-run flag that
+      # exits non-zero without modifying files. Confirm against funcsort's
+      # actual CLI before relying on this in a real repo.
+      - name: funcsort check
+        run: uvx funcsort --check
+
+      # fix-lazy is not yet published to PyPI (see copier.yml use_fix_lazy
+      # help text). Left commented out until it ships.
+      # TODO: uncomment once fix-lazy is published to PyPI
+      # - name: fix-lazy check
+      #   run: uvx fix-lazy --check

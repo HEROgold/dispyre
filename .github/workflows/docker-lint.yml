@@ -1,0 +1,43 @@
+name: Docker lint
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".github/workflows/docker-lint.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+
+jobs:
+  hadolint:
+    name: hadolint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+  droast:
+    name: droast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # VERIFY: droast is a very new (2026), low-adoption tool — its GitHub
+      # Action interface may not match this invocation. Confirm against
+      # https://github.com/immanuwell/dockerfile-roast before relying on it.
+      - name: Run droast
+        uses: immanuwell/dockerfile-roast@v1
+        with:
+          path: Dockerfile
+
+# Both linters are included deliberately, not redundantly: an empirical
+# comparison run against a seeded test Dockerfile found non-overlapping
+# coverage — hadolint catches ShellCheck-derived RUN-line shell issues
+# (unpinned apt packages, missing `SHELL -o pipefail`) that droast has no
+# equivalent for; droast catches root-user, missing HEALTHCHECK, unverified
+# curl-pipe-to-shell, and Python-stack env hygiene (PYTHONUNBUFFERED /
+# PYTHONDONTWRITEBYTECODE) that hadolint misses entirely.

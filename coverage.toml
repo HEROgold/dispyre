@@ -1,0 +1,12 @@
+[run]
+source = ["src/dispyre"]
+omit = ["*/tests/*"]
+
+[report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "def __repr__",
+]
+fail_under = 95

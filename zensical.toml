@@ -1,0 +1,33 @@
+# Native Zensical config (not the MkDocs-compatibility mkdocs.yml shim —
+# Zensical's own docs confirm zensical.toml is a distinct, first-class format:
+# same settings surface as mkdocs.yml, but everything scoped under [project].
+#
+# VERIFY: the top-level keys below (site_name, repo_url, repo_name, theme.name)
+# are confirmed by Zensical's configuration reference. The `nav` and `plugins`
+# sections are a best-effort TOML translation of the equivalent mkdocs.yml
+# shape — Zensical's docs did not publish a concrete zensical.toml example for
+# either at time of writing, and mkdocstrings support specifically is not yet
+# confirmed at all (only that a "growing list" of plugin replacements is in
+# progress: https://zensical.org/plugins/). If `zensical build`/`zensical
+# serve` reject this file, check that page and Zensical's own migration tool
+# (when available) before assuming the surrounding template is broken.
+
+[project]
+site_name = "Dispyre"
+site_description = "Opinionated, personal discord api wrapper + framework"
+repo_url = "https://github.com/HEROgold/dispyre"
+repo_name = "HEROgold/dispyre"
+
+[project.theme]
+name = "material"
+
+[[project.nav]]
+title = "Home"
+path = "index.md"
+
+[[project.nav]]
+title = "API Reference"
+path = "api.md"
+
+[project.plugins.mkdocstrings.handlers.python.options]
+docstring_style = "google"

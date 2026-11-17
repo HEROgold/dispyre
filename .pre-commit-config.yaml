@@ -1,0 +1,84 @@
+# Pre-commit hooks for Dispyre.
+#
+# Deliberately *not* using upstream mirror-repo hooks (e.g. mirrors-mypy,
+# mirrors-ruff) for our own tools: those pin a tool version in this file,
+# separate from (and easy to drift out of sync with) the version actually
+# locked in uv.lock. Instead, our own tools run as `repo: local` hooks that
+# shell out via `uvx`/`uv run`, so pre-commit always exercises whatever this
+# project's uv.lock actually pins.
+#
+# The generic file-hygiene hooks below have no such version-drift concern
+# (they don't correspond to anything in uv.lock), so they're pulled from the
+# standard upstream repo as-is.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check --fix
+        entry: uv run ruff check --fix
+        language: system
+        types: [python]
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types: [python]
+      - id: ty
+        name: ty check
+        entry: uv run ty check
+        language: system
+        pass_filenames: false
+        types: [python]
+      - id: pyrefly
+        name: pyrefly check
+        entry: uv run pyrefly check
+        language: system
+        pass_filenames: false
+        types: [python]
+
+  # funcsort ships its own reusable pre-commit hook definition
+  # (.pre-commit-hooks.yaml) rather than requiring a local uvx wrapper here.
+  # Pinned to a release tag, not `main` — a mutable ref (branch/moving tag)
+  # makes hook versions silently drift and prek warns about it explicitly.
+  # Bump periodically: gh api repos/HEROgold/funcsort/releases/latest --jq '.tag_name'
+  - repo: https://github.com/HEROgold/funcsort
+    rev: v1.0.0
+    hooks:
+      - id: funcsort
+
+  # TODO: fix-lazy is not yet published to PyPI — uncomment once it's
+  # available and `uvx fix-lazy` resolves.
+  # - repo: local
+  #   hooks:
+  #     - id: fix-lazy
+  #       name: fix-lazy
+  #       entry: uvx fix-lazy
+  #       language: system
+  #       pass_filenames: false
+  #       types: [python]
+
+  - repo: local
+    hooks:
+      - id: uv-sync-check
+        name: uv sync (pre-push)
+        entry: uv sync --locked
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: uv-lock-check
+        name: uv lock --check (pre-push)
+        entry: uv lock --check
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
